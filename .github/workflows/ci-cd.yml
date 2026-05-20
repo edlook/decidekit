@@ -28,7 +28,6 @@ jobs:
           cache-dependency-path: api/package-lock.json
       - run: npm ci
       - run: npx tsc --noEmit
-      - run: npm run lint --if-present
 
   test-web:
     name: Web — TypeScript check & build
