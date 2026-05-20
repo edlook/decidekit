@@ -1,0 +1,172 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_API: ghcr.io/${{ github.repository }}/api
+  IMAGE_WEB: ghcr.io/${{ github.repository }}/web
+
+jobs:
+  # ── Test & Lint ─────────────────────────────────────────────────────────
+  test-api:
+    name: API — TypeScript check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run lint --if-present
+
+  test-web:
+    name: Web — TypeScript check & build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ai-commerce-platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ai-commerce-platform/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: https://api.decidekit.com/api
+
+  # ── Build & Push Docker images ──────────────────────────────────────────
+  build-and-push:
+    name: Build & push images
+    needs: [test-api, test-web]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          push: true
+          tags: |
+            ${{ env.IMAGE_API }}:latest
+            ${{ env.IMAGE_API }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_API }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_API }}:buildcache,mode=max
+
+      - name: Build & push Web image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./ai-commerce-platform
+          push: true
+          tags: |
+            ${{ env.IMAGE_WEB }}:latest
+            ${{ env.IMAGE_WEB }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE_WEB }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_WEB }}:buildcache,mode=max
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}
+
+  # ── Deploy to production ────────────────────────────────────────────────
+  deploy:
+    name: Deploy to production
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy deploy files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: "deploy/docker-compose.production.yml,deploy/nginx/"
+          target: "/opt/decidekit"
+          strip_components: 1
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/decidekit
+
+            # Pull latest images
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull ${{ env.IMAGE_API }}:${{ github.sha }}
+            docker pull ${{ env.IMAGE_WEB }}:${{ github.sha }}
+
+            # Tag as latest
+            docker tag ${{ env.IMAGE_API }}:${{ github.sha }} ${{ env.IMAGE_API }}:latest
+            docker tag ${{ env.IMAGE_WEB }}:${{ github.sha }} ${{ env.IMAGE_WEB }}:latest
+
+            # Rolling restart (zero downtime)
+            docker compose -f docker-compose.production.yml up -d --no-build --remove-orphans api
+            sleep 5
+            docker compose -f docker-compose.production.yml up -d --no-build --remove-orphans web
+            docker compose -f docker-compose.production.yml up -d --no-build nginx
+
+            # Cleanup old images
+            docker image prune -f
+
+            echo "✅ Deployed ${{ github.sha }}"
+
+
+      - name: Run database migrations and seed (first deploy only)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            # Only seed if products table is empty
+            COUNT=$(docker exec decidekit_postgres psql -U postgres -d decidekitdb -t -c "SELECT COUNT(*) FROM product_concepts;" 2>/dev/null | tr -d ' ' || echo "0")
+            if [ "$COUNT" = "0" ]; then
+              echo "Empty DB — running seed…"
+              docker exec decidekit_api node dist/database/seeds/run-seed.js
+            else
+              echo "DB already seeded ($COUNT products) — skipping"
+            fi
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "❌ Deploy failed for commit ${{ github.sha }}"
+          # Add Slack/email notification here if needed

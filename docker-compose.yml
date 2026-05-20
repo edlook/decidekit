@@ -1,0 +1,125 @@
+version: '3.9'
+
+# Run from the repo root: docker compose up -d
+# Builds both images from their respective subdirectories
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: decidekit_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-decidekitdb}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASS:-password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USER:-postgres}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    container_name: decidekit_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+
+  opensearch:
+    image: opensearchproject/opensearch:2.12.0
+    container_name: decidekit_opensearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -sf http://localhost:9200/_cluster/health']
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    networks: [internal]
+
+  api:
+    build:
+      context: ./api          # NestJS project root
+      dockerfile: Dockerfile
+    container_name: decidekit_api
+    restart: unless-stopped
+    env_file:
+      - .env                  # Root .env file
+    environment:
+      NODE_ENV: production
+      DB_HOST: postgres
+      REDIS_HOST: redis
+      OPENSEARCH_URL: http://opensearch:9200
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    networks: [internal, public]
+
+  web:
+    build:
+      context: ./ai-commerce-platform   # Next.js project root
+      dockerfile: Dockerfile
+    container_name: decidekit_web
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://api:3001/api}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    networks: [internal, public]
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: decidekit_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/sites:/etc/nginx/sites-enabled:ro
+      - certbot_certs:/etc/letsencrypt:ro
+      - certbot_www:/var/www/certbot:ro
+    depends_on:
+      - web
+      - api
+    networks: [public]
+    profiles: [production]
+
+volumes:
+  postgres_data:
+  redis_data:
+  opensearch_data:
+  certbot_certs:
+  certbot_www:
+
+networks:
+  internal:
+    driver: bridge
+    internal: true
+  public:
+    driver: bridge
