@@ -40,7 +40,7 @@ import { SearchModule } from './modules/search/search.module'
         entities: [ProductConcept, Offer, Merchant, ClickEvent, FeedIngestionJob],
         synchronize: config.get<boolean>('database.synchronize'),
         logging: config.get<boolean>('database.logging'),
-        ssl: config.get<string>('app.nodeEnv') === 'production'
+        ssl: config.get<string>('database.url')?.includes('sslmode=require')
           ? { rejectUnauthorized: false }
           : false,
       }),
